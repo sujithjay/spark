@@ -20,20 +20,18 @@ package org.apache.spark.sql.kafka010
 import java.io.{File, IOException}
 import java.lang.{Integer => JInt}
 import java.net.InetSocketAddress
-import java.util.{Map => JMap, Properties}
+import java.util.{Collections, Map => JMap, Properties, UUID}
 import java.util.concurrent.TimeUnit
 
 import scala.collection.JavaConverters._
-import scala.language.postfixOps
 import scala.util.Random
 
-import kafka.admin.AdminUtils
 import kafka.api.Request
 import kafka.server.{KafkaConfig, KafkaServer}
 import kafka.server.checkpoints.OffsetCheckpointFile
 import kafka.utils.ZkUtils
 import org.apache.kafka.clients.CommonClientConfigs
-import org.apache.kafka.clients.admin.{AdminClient, CreatePartitionsOptions, NewPartitions}
+import org.apache.kafka.clients.admin.{AdminClient, CreatePartitionsOptions, ListConsumerGroupsResult, NewPartitions, NewTopic}
 import org.apache.kafka.clients.consumer.KafkaConsumer
 import org.apache.kafka.clients.producer._
 import org.apache.kafka.common.TopicPartition
@@ -43,9 +41,9 @@ import org.apache.zookeeper.server.{NIOServerCnxnFactory, ZooKeeperServer}
 import org.scalatest.concurrent.Eventually._
 import org.scalatest.time.SpanSugar._
 
-import org.apache.spark.SparkConf
+import org.apache.spark.{SparkConf, SparkException}
 import org.apache.spark.internal.Logging
-import org.apache.spark.util.Utils
+import org.apache.spark.util.{ShutdownHookManager, Utils}
 
 /**
  * This is a helper class for Kafka test suites. This has the functionality to set up
@@ -56,10 +54,10 @@ import org.apache.spark.util.Utils
 class KafkaTestUtils(withBrokerProps: Map[String, Object] = Map.empty) extends Logging {
 
   // Zookeeper related configurations
-  private val zkHost = "localhost"
+  private val zkHost = "127.0.0.1"
   private var zkPort: Int = 0
   private val zkConnectionTimeout = 60000
-  private val zkSessionTimeout = 6000
+  private val zkSessionTimeout = 10000
 
   private var zookeeper: EmbeddedZookeeper = _
 
@@ -67,7 +65,7 @@ class KafkaTestUtils(withBrokerProps: Map[String, Object] = Map.empty) extends L
   private var adminClient: AdminClient = null
 
   // Kafka broker related configurations
-  private val brokerHost = "localhost"
+  private val brokerHost = "127.0.0.1"
   private var brokerPort = 0
   private var brokerConf: KafkaConfig = _
 
@@ -80,6 +78,7 @@ class KafkaTestUtils(withBrokerProps: Map[String, Object] = Map.empty) extends L
   // Flag to test whether the system is correctly started
   private var zkReady = false
   private var brokerReady = false
+  private var leakDetector: AnyRef = null
 
   def zkAddress: String = {
     assert(zkReady, "Zookeeper not setup yet or already torn down, cannot get zookeeper address")
@@ -129,21 +128,35 @@ class KafkaTestUtils(withBrokerProps: Map[String, Object] = Map.empty) extends L
 
   /** setup the whole embedded servers, including Zookeeper and Kafka brokers */
   def setup(): Unit = {
+    // Set up a KafkaTestUtils leak detector so that we can see where the leak KafkaTestUtils is
+    // created.
+    val exception = new SparkException("It was created at: ")
+    leakDetector = ShutdownHookManager.addShutdownHook { () =>
+      logError("Found a leak KafkaTestUtils.", exception)
+    }
+
     setupEmbeddedZookeeper()
     setupEmbeddedKafkaServer()
-    eventually(timeout(60.seconds)) {
+    eventually(timeout(1.minute)) {
       assert(zkUtils.getAllBrokersInCluster().nonEmpty, "Broker was not up in 60 seconds")
     }
   }
 
   /** Teardown the whole servers, including Kafka broker and Zookeeper */
   def teardown(): Unit = {
+    if (leakDetector != null) {
+      ShutdownHookManager.removeShutdownHook(leakDetector)
+    }
     brokerReady = false
     zkReady = false
 
     if (producer != null) {
       producer.close()
       producer = null
+    }
+
+    if (adminClient != null) {
+      adminClient.close()
     }
 
     if (server != null) {
@@ -180,7 +193,8 @@ class KafkaTestUtils(withBrokerProps: Map[String, Object] = Map.empty) extends L
     var created = false
     while (!created) {
       try {
-        AdminUtils.createTopic(zkUtils, topic, partitions, 1)
+        val newTopic = new NewTopic(topic, partitions, 1)
+        adminClient.createTopics(Collections.singleton(newTopic))
         created = true
       } catch {
         // Workaround fact that TopicExistsException is in kafka.common in 0.10.0 and
@@ -207,7 +221,7 @@ class KafkaTestUtils(withBrokerProps: Map[String, Object] = Map.empty) extends L
   /** Delete a Kafka topic and wait until it is propagated to the whole cluster */
   def deleteTopic(topic: String): Unit = {
     val partitions = zkUtils.getPartitionsForTopics(Seq(topic))(topic).size
-    AdminUtils.deleteTopic(zkUtils, topic)
+    adminClient.deleteTopics(Collections.singleton(topic))
     verifyTopicDeletionWithRetries(zkUtils, topic, partitions, List(this.server))
   }
 
@@ -296,20 +310,30 @@ class KafkaTestUtils(withBrokerProps: Map[String, Object] = Map.empty) extends L
     offsets
   }
 
+  def listConsumerGroups(): ListConsumerGroupsResult = {
+    adminClient.listConsumerGroups()
+  }
+
   protected def brokerConfiguration: Properties = {
     val props = new Properties()
     props.put("broker.id", "0")
-    props.put("host.name", "localhost")
-    props.put("advertised.host.name", "localhost")
+    props.put("host.name", "127.0.0.1")
+    props.put("advertised.host.name", "127.0.0.1")
     props.put("port", brokerPort.toString)
     props.put("log.dir", Utils.createTempDir().getAbsolutePath)
     props.put("zookeeper.connect", zkAddress)
+    props.put("zookeeper.connection.timeout.ms", "60000")
     props.put("log.flush.interval.messages", "1")
     props.put("replica.socket.timeout.ms", "1500")
     props.put("delete.topic.enable", "true")
+    props.put("group.initial.rebalance.delay.ms", "10")
+
+    // Change the following settings as we have only 1 broker
     props.put("offsets.topic.num.partitions", "1")
     props.put("offsets.topic.replication.factor", "1")
-    props.put("group.initial.rebalance.delay.ms", "10")
+    props.put("transaction.state.log.replication.factor", "1")
+    props.put("transaction.state.log.min.isr", "1")
+
     // Can not use properties.putAll(propsMap.asJava) in scala-2.12
     // See https://github.com/scala/bug/issues/10418
     withBrokerProps.foreach { case (k, v) => props.put(k, v) }
@@ -324,6 +348,19 @@ class KafkaTestUtils(withBrokerProps: Map[String, Object] = Map.empty) extends L
     // wait for all in-sync replicas to ack sends
     props.put("acks", "all")
     props
+  }
+
+  /** Call `f` with a `KafkaProducer` that has initialized transactions. */
+  def withTranscationalProducer(f: KafkaProducer[String, String] => Unit): Unit = {
+    val props = producerConfiguration
+    props.put("transactional.id", UUID.randomUUID().toString)
+    val producer = new KafkaProducer[String, String](props)
+    try {
+      producer.initTransactions()
+      f(producer)
+    } finally {
+      producer.close()
+    }
   }
 
   private def consumerConfiguration: Properties = {
@@ -376,7 +413,7 @@ class KafkaTestUtils(withBrokerProps: Map[String, Object] = Map.empty) extends L
       topic: String,
       numPartitions: Int,
       servers: Seq[KafkaServer]) {
-    eventually(timeout(60.seconds), interval(200.millis)) {
+    eventually(timeout(1.minute), interval(200.milliseconds)) {
       try {
         verifyTopicDeletion(topic, numPartitions, servers)
       } catch {
@@ -384,14 +421,15 @@ class KafkaTestUtils(withBrokerProps: Map[String, Object] = Map.empty) extends L
           // As pushing messages into Kafka updates Zookeeper asynchronously, there is a small
           // chance that a topic will be recreated after deletion due to the asynchronous update.
           // Hence, delete the topic and retry.
-          AdminUtils.deleteTopic(zkUtils, topic)
+          adminClient.deleteTopics(Collections.singleton(topic))
           throw e
       }
     }
   }
 
   private def waitUntilMetadataIsPropagated(topic: String, partition: Int): Unit = {
-    def isPropagated = server.apis.metadataCache.getPartitionInfo(topic, partition) match {
+    def isPropagated = server.dataPlaneRequestProcessor.metadataCache
+        .getPartitionInfo(topic, partition) match {
       case Some(partitionState) =>
         zkUtils.getLeaderForPartition(topic, partition).isDefined &&
           Request.isValidBrokerId(partitionState.basePartitionState.leader) &&
@@ -400,8 +438,18 @@ class KafkaTestUtils(withBrokerProps: Map[String, Object] = Map.empty) extends L
       case _ =>
         false
     }
-    eventually(timeout(60.seconds)) {
+    eventually(timeout(1.minute)) {
       assert(isPropagated, s"Partition [$topic, $partition] metadata not propagated after timeout")
+    }
+  }
+
+  /**
+   * Wait until the latest offset of the given `TopicPartition` is not less than `offset`.
+   */
+  def waitUntilOffsetAppears(topicPartition: TopicPartition, offset: Long): Unit = {
+    eventually(timeout(1.minute)) {
+      val currentOffset = getLatestOffsets(Set(topicPartition.topic)).get(topicPartition)
+      assert(currentOffset.nonEmpty && currentOffset.get >= offset)
     }
   }
 

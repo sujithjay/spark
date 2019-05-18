@@ -173,10 +173,11 @@ private[spark] object TestUtils {
    * Run some code involving jobs submitted to the given context and assert that the jobs spilled.
    */
   def assertSpilled(sc: SparkContext, identifier: String)(body: => Unit): Unit = {
-    withListener(sc, new SpillListener) { listener =>
+    val listener = new SpillListener
+    withListener(sc, listener) { _ =>
       body
-      assert(listener.numSpilledStages > 0, s"expected $identifier to spill, but did not")
     }
+    assert(listener.numSpilledStages > 0, s"expected $identifier to spill, but did not")
   }
 
   /**
@@ -184,10 +185,25 @@ private[spark] object TestUtils {
    * did not spill.
    */
   def assertNotSpilled(sc: SparkContext, identifier: String)(body: => Unit): Unit = {
-    withListener(sc, new SpillListener) { listener =>
+    val listener = new SpillListener
+    withListener(sc, listener) { _ =>
       body
-      assert(listener.numSpilledStages == 0, s"expected $identifier to not spill, but did")
     }
+    assert(listener.numSpilledStages == 0, s"expected $identifier to not spill, but did")
+  }
+
+  /**
+   * Asserts that exception message contains the message. Please note this checks all
+   * exceptions in the tree.
+   */
+  def assertExceptionMsg(exception: Throwable, msg: String): Unit = {
+    var e = exception
+    var contains = e.getMessage.contains(msg)
+    while (e.getCause != null && !contains) {
+      e = e.getCause
+      contains = e.getMessage.contains(msg)
+    }
+    assert(contains, s"Exception tree doesn't contain the expected message: $msg")
   }
 
   /**

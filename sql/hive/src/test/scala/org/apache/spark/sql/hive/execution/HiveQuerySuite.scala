@@ -84,7 +84,7 @@ class HiveQuerySuite extends HiveComparisonTest with SQLTestUtils with BeforeAnd
   }
 
   // Testing the Broadcast based join for cartesian join (cross join)
-  // We assume that the Broadcast Join Threshold will works since the src is a small table
+  // We assume that the Broadcast Join Threshold will work since the src is a small table
   private val spark_10484_1 = """
                                 | SELECT a.key, b.key
                                 | FROM src a LEFT JOIN src b WHERE a.key > b.key + 300
@@ -740,10 +740,6 @@ class HiveQuerySuite extends HiveComparisonTest with SQLTestUtils with BeforeAnd
     sql("select key, count(*) c from src group by key having c").collect()
   }
 
-  test("SPARK-2225: turn HAVING without GROUP BY into a simple filter") {
-    assert(sql("select key from src having key > 490").collect().size < 100)
-  }
-
   test("union/except/intersect") {
     assertResult(Array(Row(1), Row(1))) {
       sql("select 1 as a union all select 1 as a").collect()
@@ -820,7 +816,7 @@ class HiveQuerySuite extends HiveComparisonTest with SQLTestUtils with BeforeAnd
 
   test("ADD JAR command 2") {
     // this is a test case from mapjoin_addjar.q
-    val testJar = TestHive.getHiveFile("hive-hcatalog-core-0.13.1.jar").toURI
+    val testJar = TestHive.getHiveHcatalogCoreJar().toURI
     val testData = TestHive.getHiveFile("data/files/sample.json").toURI
     sql(s"ADD JAR $testJar")
     sql(
@@ -830,9 +826,9 @@ class HiveQuerySuite extends HiveComparisonTest with SQLTestUtils with BeforeAnd
     sql("select * from src join t1 on src.key = t1.a")
     sql("DROP TABLE t1")
     assert(sql("list jars").
-      filter(_.getString(0).contains("hive-hcatalog-core-0.13.1.jar")).count() > 0)
+      filter(_.getString(0).contains(TestHive.HIVE_HCATALOG_CORE_JAR)).count() > 0)
     assert(sql("list jar").
-      filter(_.getString(0).contains("hive-hcatalog-core-0.13.1.jar")).count() > 0)
+      filter(_.getString(0).contains(TestHive.HIVE_HCATALOG_CORE_JAR)).count() > 0)
     val testJar2 = TestHive.getHiveFile("TestUDTF.jar").getCanonicalPath
     sql(s"ADD JAR $testJar2")
     assert(sql(s"list jar $testJar").count() == 1)
